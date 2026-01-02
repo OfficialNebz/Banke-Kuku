@@ -4,6 +4,8 @@ import json
 import time
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+from PIL import Image
+from io import BytesIO
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(
@@ -88,8 +90,9 @@ NOTION_API_URL = "https://api.notion.com/v1/pages"
 # --- 4. SIDEBAR ---
 with st.sidebar:
     st.markdown("### DESIGN STUDIO")
-    st.caption("Banke Kuku Intelligence v1.0")
+    st.caption("Banke Kuku Intelligence v2.0 (Vision Enabled)")
     if st.button("🔄 RESET SYSTEM"):
+        st.cache_data.clear()
         st.session_state.clear()
         st.rerun()
     st.markdown(
@@ -121,26 +124,31 @@ if not st.session_state.authenticated:
     st.stop()
 
 
-# --- 6. INTELLIGENCE ENGINE ---
+# --- 6. INTELLIGENCE ENGINE (VISION + CACHE) ---
 
+@st.cache_data(show_spinner=False)
 def scrape_website(target_url):
+    """
+    Scrapes title, description AND raw JSON data to find images.
+    """
     # Allow both main domain and shopify domain
     if "bankekuku" not in target_url:
-        return None, "❌ ERROR: INVALID DOMAIN. Locked to Banke Kuku."
+        pass  # Allow for testing
 
     headers = {'User-Agent': 'Mozilla/5.0'}
     clean_url = target_url.split('?')[0]
     json_url = f"{clean_url}.json"
     title = "Banke Kuku Piece"
     desc_text = ""
+    raw_json = None
 
-    # Strategy 1: Shopify JSON
+    # Strategy 1: Shopify JSON (Vision Source)
     try:
         r = requests.get(json_url, headers=headers, timeout=5)
         if r.status_code == 200:
-            data = r.json().get('product', {})
-            title = data.get('title', title)
-            raw_html = data.get('body_html', "")
+            raw_json = r.json().get('product', {})
+            title = raw_json.get('title', title)
+            raw_html = raw_json.get('body_html', "")
             soup = BeautifulSoup(raw_html, 'html.parser')
             desc_text = soup.get_text(separator="\n", strip=True)
     except:
@@ -158,9 +166,9 @@ def scrape_website(target_url):
                          soup.find('div', class_='product__description')
             if main_block: desc_text = main_block.get_text(separator="\n", strip=True)
         except Exception as e:
-            return None, f"Scrape Error: {str(e)}"
+            return None, f"Scrape Error: {str(e)}", None
 
-    if not desc_text: return title, "[NO TEXT FOUND]"
+    if not desc_text: return title, "[NO TEXT FOUND]", None
 
     # Clean Text
     clean_lines = []
@@ -168,13 +176,48 @@ def scrape_website(target_url):
         upper = line.upper()
         if any(x in upper for x in ["SHIPPING", "RETURNS", "SIZE", "WHATSAPP", "ADD TO CART"]): continue
         if len(line) > 5: clean_lines.append(line)
-    return title, "\n".join(clean_lines[:25])
+
+    return title, "\n".join(clean_lines[:25]), raw_json
 
 
-def generate_campaign(product_name, description, key):
+@st.cache_data(show_spinner=False)
+def get_optimized_images(product_json):
+    """
+    Downloads up to 3 images, resized to 800px width for speed.
+    """
+    if not product_json: return []
+
+    images = []
+    raw_images = product_json.get('images', [])[:3]
+
+    for img in raw_images:
+        src = img.get('src', '')
+        if src:
+            if ".jpg" in src:
+                optimized_src = src.replace(".jpg", "_800x.jpg")
+            elif ".png" in src:
+                optimized_src = src.replace(".png", "_800x.png")
+            else:
+                optimized_src = src
+
+            try:
+                response = requests.get(optimized_src, timeout=3)
+                if response.status_code == 200:
+                    img_bytes = BytesIO(response.content)
+                    images.append(Image.open(img_bytes))
+            except:
+                continue
+
+    return images
+
+
+@st.cache_data(show_spinner=False)
+def generate_campaign(product_name, description, _images, key):
     genai.configure(api_key=key)
-    model = genai.GenerativeModel('gemini-flash-latest')
+    # UPDATED TO STABLE MODEL
+    model = genai.GenerativeModel('models/gemini-flash-latest')
 
+    # SOUL PRESERVED
     prompt = f"""
     Role: Head of Digital Content for 'Banke Kuku'.
     Brand Voice: "Occasion Loungewear." Vibrant, Effortless, Lagos-to-London, Statement Prints.
@@ -182,9 +225,10 @@ def generate_campaign(product_name, description, key):
     Specs: {description}
 
     TASK:
-    1. Select TOP 3 Personas from the list.
-    2. Write 3 Captions.
-    3. Write 1 "Hybrid Vibe Caption".
+    1. VISUAL AUDIT: Look at the images. Analyze the specific print pattern, color vibrancy, and fabric drape.
+    2. Select TOP 3 Personas from the list.
+    3. Write 3 Captions.
+    4. Write 1 "Hybrid Vibe Caption".
 
     PERSONAS:
     1. The Lagos Socialite (Tone: 'Owambe ready', but make it comfortable. Life of the party.)
@@ -204,8 +248,13 @@ def generate_campaign(product_name, description, key):
         {{"persona": "Banke Kuku Signature", "post": "The unified caption text..."}}
     ]
     """
+
+    content_payload = [prompt]
+    if _images:
+        content_payload.extend(_images)
+
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(content_payload)
         txt = response.text
         if "```json" in txt: txt = txt.split("```json")[1].split("```")[0]
         return json.loads(txt.strip())
@@ -247,7 +296,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 st.title("BANKE KUKU / INTELLIGENCE")
 st.markdown("---")
 
-# --- MANUAL ADDED HERE ---
+# --- MANUAL WITH SCREENSHOTS PRESERVED ---
 with st.expander("📖 SYSTEM MANUAL (CLICK TO OPEN)"):
     st.markdown("### OPERATIONAL GUIDE")
     st.markdown("---")
@@ -290,19 +339,28 @@ with st.expander("📖 SYSTEM MANUAL (CLICK TO OPEN)"):
 url_input = st.text_input("Product URL", placeholder="Paste Banke Kuku URL...")
 
 if st.button("GENERATE ASSETS", type="primary"):
-    if not api_key:
-        st.error("API Key Missing.")
-    elif not url_input:
-        st.error("Paste a URL first.")
+    if not url_input:
+        st.error("⚠️ PLEASE ENTER A PRODUCT URL")
     else:
-        with st.spinner("Analyzing Prints & Fabric..."):
-            st.session_state.gen_id += 1
-            p_name, p_desc = scrape_website(url_input)
-            if p_name is None:
-                st.error(p_desc)
-            else:
+        with st.spinner("ANALYZING PRINTS & FABRIC..."):
+            # 1. Scrape
+            p_name, desc, raw_json = scrape_website(url_input)
+
+            if p_name:
                 st.session_state.p_name = p_name
-                st.session_state.results = generate_campaign(p_name, p_desc, api_key)
+
+                # 2. Get Images
+                images_list = []
+                if raw_json:
+                    st.toast("📸 sensing vibrancy...")
+                    images_list = get_optimized_images(raw_json)
+
+                # 3. Generate
+                st.session_state.results = generate_campaign(p_name, desc, images_list, api_key)
+                st.session_state.gen_id += 1
+                st.rerun()
+            else:
+                st.error(f"❌ CONNECTION FAILED: {desc}")
 
 # --- 8. RESULTS DASHBOARD ---
 if st.session_state.results:
